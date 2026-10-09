@@ -32,6 +32,57 @@ Choose a context limit supported by the model. CPU testing can use
 `--device cpu --dtype float32`. Model IDs from Hugging Face are also accepted;
 a local model directory avoids downloading weights again.
 
+## SGLang backend
+
+The SGLang backend keeps the existing `/v1/classifier` contract and prompt
+compiler, but sends the compiled token branches to an SGLang server's native
+`/v1/score` endpoint. Simple-JEV loads only the matching tokenizer and config;
+SGLang owns the model weights, KV cache, continuous batching, and GPU execution.
+
+Start SGLang with the same checkpoint used by the gateway:
+
+```bash
+python -m sglang.launch_server \
+  --model-path /path/to/Qwen3.5-9B-Base \
+  --served-model-name Qwen3.5-9B-Base \
+  --host 127.0.0.1 --port 30000 --context-length 32768
+```
+
+Then start Simple-JEV:
+
+```bash
+python hf-server/hf_server.py \
+  --backend sglang \
+  --model /path/to/Qwen3.5-9B-Base \
+  --served-model-name Qwen3.5-9B-Base \
+  --sglang-endpoint http://127.0.0.1:30000 \
+  --sglang-model Qwen3.5-9B-Base \
+  --sglang-concurrency 32 \
+  --max-model-len 32768 --host 0.0.0.0 --port 8000
+```
+
+For a single-container deployment, `scripts/run_sglang_gateway.sh` starts both
+processes and waits for SGLang readiness before exposing the gateway. The backend
+currently supports text requests only. `options.raw_logits` is rejected because
+SGLang exposes candidate token logprobs rather than raw logits. The tokenizer,
+model revision, prompt policy, and context limit must match the SGLang model.
+
+For latency-sensitive 8K scoring on NVIDIA H20, the tested high-throughput
+profile uses FP8 weights, FA3, two-way tensor parallelism, and Radix Cache:
+
+```bash
+TP_SIZE=2 SGLANG_QUANTIZATION=fp8 ATTENTION_BACKEND=fa3 \
+SCHEDULE_POLICY=lpm MAX_RUNNING_REQUESTS=32 MAX_PREFILL_TOKENS=65536 \
+CHUNKED_PREFILL_SIZE=-1 MEM_FRACTION_STATIC=0.85 \
+bash scripts/run_sglang_gateway.sh
+```
+
+`TP_SIZE=1` is the single-GPU alternative. Set `DISABLE_RADIX_CACHE=1` only
+when cross-request prefix reuse is undesirable or when measuring a strict
+zero-cache baseline. FP8 changes probabilities slightly, so validate its
+accuracy on representative data before production use. The large static memory
+fraction reserves KV-cache capacity up front rather than reflecting live usage.
+
 ## Cloudflare CLEF and CLEF-Flash
 
 Use the native backend for both releases. It loads the backbone **and trained joint

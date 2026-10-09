@@ -301,6 +301,7 @@ class PromptCompiler:
                 messages, request, question.question_id, self.prompt_policy
             )
             ids, output_ids, model_inputs, image_mask = [], [], None, None
+            label_encodings = None
             if not render_only:
                 renderer = processor if processor is not None else self.tokenizer
                 # Render first, then append incomplete JSON to the open assistant
@@ -346,6 +347,18 @@ class PromptCompiler:
                     model_inputs = processor_inputs(processor, text, images, self.max_tokens)
                     image_mask = image_token_mask(processor, model_inputs)
                     ids = model_inputs['input_ids'][0].tolist()
+                elif getattr(self.tokenizer, "is_fast", False):
+                    # Preserve exact full-prompt boundary validation while letting
+                    # the Rust tokenizer process candidate extensions in parallel.
+                    encoded = self.tokenizer(
+                        [text] + [
+                            text + label for label in question.output_labels
+                        ],
+                        add_special_tokens=False,
+                        return_attention_mask=False,
+                        return_token_type_ids=False,
+                    )["input_ids"]
+                    ids, label_encodings = encoded[0], encoded[1:]
                 else:
                     ids = self.tokenizer.encode(text, add_special_tokens=False)
                 if not ids or len(ids) > self.max_tokens:
@@ -354,12 +367,14 @@ class PromptCompiler:
                     )
                 # Derive IDs at the actual rendered boundary, not from isolated
                 # label encoding. Check every branch; templates/context can affect it.
-                for label in question.output_labels:
+                for label_index, label in enumerate(question.output_labels):
                     if processor is not None:
                         # Check the actual expanded image-token boundary, not a
                         # text-only approximation. Image preprocessing is memoized.
                         extended = processor_inputs(processor, text + label, images,
                                                     self.max_tokens + 1)['input_ids'][0].tolist()
+                    elif label_encodings is not None:
+                        extended = label_encodings[label_index]
                     else:
                         extended = self.tokenizer.encode(text + label, add_special_tokens=False)
                     if len(extended) != len(ids) + 1 or extended[:-1] != ids:
@@ -918,6 +933,7 @@ class DecisionService:
                         }
                     return response
                 # Tokenization can be expensive and must not block cancellation/HTTP.
+                compile_start = time.perf_counter()
                 if hasattr(self.compiler, "compile_async"):
                     compiled = await self.compiler.compile_async(request)
                 else:
@@ -929,9 +945,11 @@ class DecisionService:
                             "Multimodal/tool chat requires a native renderer; this backend accepts text chat only"
                         )
                     compiled = await asyncio.to_thread(self.compiler.compile, request)
+                compile_seconds = time.perf_counter() - compile_start
                 # The compiler retains the shared plan alongside executable IDs.
                 # Never reconstruct label meaning from model output or batch order.
                 result = await self.backend.score(compiled)
+                response_start = time.perf_counter()
                 response = build_response(
                     compiled.plan,
                     result.logits,
@@ -944,6 +962,7 @@ class DecisionService:
                     advanced=self.advanced_metrics,
                 )
                 restore_binary_noul(response, compiled.binary_noul_keys)
+                response_seconds = time.perf_counter() - response_start
                 # Common handles answer filtering and authoritative version data;
                 # HF only adds backend-specific metadata and execution timings.
                 if self.advanced_metrics:
@@ -955,6 +974,8 @@ class DecisionService:
                     response["metrics"] = {
                         **result.metrics,
                         "queue_seconds": queued,
+                        "compile_seconds": compile_seconds,
+                        "response_seconds": response_seconds,
                         "total_seconds": time.perf_counter() - start,
                     }
                 return response
@@ -1046,6 +1067,12 @@ def create_app(service):
     """
     app = FastAPI(title="Simple-JEV", version="0.1.0")
 
+    @app.on_event("shutdown")
+    async def close_backend():
+        close = getattr(service.backend, "aclose", None)
+        if close is not None:
+            await close()
+
     @app.get("/health")
     async def health():
         """Return the configured model identifier without invoking inference."""
@@ -1127,6 +1154,11 @@ def load_service(
     max_image_height=None,
     default_image_max_width=None,
     default_image_max_height=None,
+    sglang_endpoint=None,
+    sglang_api_key=None,
+    sglang_model=None,
+    sglang_timeout=60.0,
+    sglang_concurrency=32,
 ):
     """Load a model and return a ready-to-use service, without starting HTTP.
 
@@ -1137,9 +1169,9 @@ def load_service(
     padded suffix tokens per batch, not shared-prefix prefill or total KV memory.
     max_request_branches caps questions admitted in a single request.
 
-    The loader sets service concurrency to one: separate requests are serialized,
-    while branches within a request are batched. The backend's thread lock also
-    prevents overlap if cancellation releases admission before a forward ends.
+    Local backends serialize separate requests while batching branches within a
+    request. SGLang uses its configured request concurrency and delegates GPU
+    scheduling to the remote engine.
     """
     from hf_vision import validate_image_resize_config
     validate_image_resize_config(max_image_width, max_image_height,
@@ -1155,6 +1187,62 @@ def load_service(
     if served_model_name is not None and not served_model_name.strip():
         raise ValueError("served_model_name must not be empty")
     public_model = served_model_name if served_model_name is not None else model_name
+    if backend == "sglang":
+        if not sglang_endpoint:
+            raise ValueError("--sglang-endpoint is required with --backend sglang")
+        if subfolder or rope_factor != 1:
+            raise ValueError(
+                "SGLang owns model loading; subfolder and local RoPE scaling are unsupported"
+            )
+        if any(value is not None for value in (
+            max_image_width,
+            max_image_height,
+            default_image_max_width,
+            default_image_max_height,
+        )):
+            raise ValueError(
+                "The SGLang backend currently supports text input only"
+            )
+        if sglang_concurrency < 1:
+            raise ValueError("--sglang-concurrency must be positive")
+        from transformers import AutoConfig, AutoTokenizer
+        from sglang_backend import SGLangBackend
+
+        tokenizer = AutoTokenizer.from_pretrained(model_name, revision=revision)
+        config = AutoConfig.from_pretrained(model_name, revision=revision)
+        prompt_policy, policy_selection = resolve_prompt_policy(config, prompt_policy)
+        compiler = PromptCompiler(
+            tokenizer,
+            max_tokens=max_model_len,
+            prompt_policy=prompt_policy,
+            max_choice_options=max_choice_options,
+        )
+        compiler.validate_choice_capacity()
+        remote_model = sglang_model or public_model
+        remote = SGLangBackend(
+            sglang_endpoint,
+            remote_model,
+            api_key=sglang_api_key,
+            timeout=sglang_timeout,
+        )
+        return DecisionService(
+            public_model,
+            compiler,
+            remote,
+            enforce_model_id=enforce_model_id,
+            max_choice_options=max_choice_options,
+            concurrency=sglang_concurrency,
+            max_request_branches=max_request_branches,
+            metadata={
+                "backend": "sglang",
+                "sglang_endpoint": sglang_endpoint,
+                "sglang_model": remote_model,
+                "prompt_policy": prompt_policy,
+                "prompt_policy_selection": policy_selection,
+                "image_input": False,
+                "model_revision": revision,
+            },
+        )
     if backend == "clef":
         if prompt_policy is not None or subfolder or rope_factor != 1:
             raise ValueError('CLEF uses its native schema head; prompt policies, subfolder and rope scaling are unsupported')
@@ -1315,8 +1403,13 @@ def main():
         help="Explicit format override; omitted: match known architecture/size, otherwise warn and use baseline. Named policies require state",
     )
     parser.add_argument(
-        "--backend", choices=["transformers", "laya", "clef"], default="transformers"
+        "--backend", choices=["transformers", "sglang", "laya", "clef"], default="transformers"
     )
+    parser.add_argument("--sglang-endpoint", help="SGLang server base URL")
+    parser.add_argument("--sglang-api-key", help="Bearer token for the SGLang server")
+    parser.add_argument("--sglang-model", help="Model ID sent to SGLang (default: served model name)")
+    parser.add_argument("--sglang-timeout", type=float, default=60.0)
+    parser.add_argument("--sglang-concurrency", type=int, default=32)
     parser.add_argument(
         "--subfolder", help="Laya checkpoint subfolder, e.g. multilingual"
     )

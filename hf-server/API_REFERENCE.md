@@ -298,13 +298,17 @@ values), `probabilities` (nine values), `expected_score`, `variance`, and `entro
 | `scored_positions` | Number of scoring branches. |
 | `backend_seconds` | Backend elapsed time inside model lock. |
 | `queue_seconds` | Wait for the service's request semaphore. |
+| `compile_seconds` | Request-to-branch prompt construction and tokenization. |
+| `response_seconds` | Common answer scoring and response construction. |
 | `total_seconds` | Service time through response construction, including queue, compilation and inference; excludes final network transmission. |
 
 ## Limits, batching and cancellation
 
-The CLI service runs one model request at a time with up to 16 additional
-requests waiting. Questions within a request execute in suffix batches. At
-capacity (17 admitted requests), additional requests receive 429.
+The Transformers CLI service runs one model request at a time with up to 16
+additional requests waiting. Questions within a request execute in suffix
+batches. At capacity (17 admitted requests), additional requests receive 429.
+The SGLang backend instead admits `--sglang-concurrency` requests (default 32);
+SGLang performs the GPU scheduling and continuous batching.
 
 The default request limit is 100 branches, configurable with
 `--max-request-branches`. Every question consumes exactly one branch. The schema
@@ -432,6 +436,12 @@ These are process settings, not HTTP request fields. Both `simple-jev` and
 | --- | --- | --- |
 | `--model` | Required | HF model ID or local pretrained model directory. Also the accepted request `model` string. |
 | `--revision` | Unset | HF revision passed to tokenizer, config and model loading. |
+| `--backend` | `transformers` | Execution backend: `transformers`, `sglang`, `laya`, or `clef`. |
+| `--sglang-endpoint` | Unset | Required for the SGLang backend. Base URL of a server exposing `/v1/score`. |
+| `--sglang-api-key` | Unset | Optional bearer token sent to the SGLang server. |
+| `--sglang-model` | served model name | Model ID sent in SGLang scoring requests. |
+| `--sglang-timeout` | `60` | Positive per-request SGLang HTTP timeout in seconds. |
+| `--sglang-concurrency` | `32` | Maximum requests admitted concurrently by the gateway when using SGLang. |
 | `--classifier-prompt-policy` | Omitted: architecture/size selection | Known profiles auto-select a recommended format; unknown profiles warn and use baseline. Explicit values always override, including baseline. |
 | `--device` | `auto` | Passed as Transformers `device_map`; examples: `auto`, `cpu`, `cuda:0`. ROCm PyTorch also uses CUDA device naming. |
 | `--dtype` | `bfloat16` | One of `float32`, `float16`, `bfloat16`. |
@@ -448,11 +458,12 @@ These are process settings, not HTTP request fields. Both `simple-jev` and
 | `--port` | `8000` | HTTP port. |
 | `-h`, `--help` | — | Print argument help and exit. |
 
-No CLI flags are currently provided for authentication, quantization, model
-aliases, request queue size, or request concurrency. Image support is selected
-from the loaded model/processor as documented in [VISION.md](VISION.md). The service requires
-compatible copyable/reorderable Transformers caches and suitable single-token
-rating/choice labels; arbitrary HF models are not guaranteed to work.
+No CLI flags are currently provided for inbound authentication, quantization, or
+request queue size. Image support is selected from the loaded model/processor as
+documented in [VISION.md](VISION.md). The service requires compatible
+copyable/reorderable Transformers caches and suitable single-token rating/choice
+labels; arbitrary HF models are not guaranteed to work. The SGLang backend is
+text-only and does not support raw-logit diagnostics.
 
 ## Source of truth
 
